@@ -38,6 +38,11 @@ logger = structlog.getLogger(__name__)
 _TERMINAL_STATUSES = frozenset({"success", "error", "interrupted"})
 _RUN_ID_PATTERN = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 
+# Run IDs cancelled during executor.stop() (pod drain). Separate from
+# _lease_loss_cancellations because execute_run's finally block discards
+# from that set before _execute_with_lease can check it.
+_drain_cancellations: set[str] = set()
+
 
 def _is_valid_run_id(value: str) -> bool:
     """Check if a string is a valid UUID v4 hex format."""
@@ -128,12 +133,14 @@ class WorkerExecutor(BaseExecutor):
             _, pending = await asyncio.wait(self._job_tasks, timeout=drain_timeout)
 
             # Mark pending tasks as drain cancellations so execute_run
-            # skips finalize — the lease will expire and the reaper on
-            # the new instance will re-enqueue the run automatically.
+            # skips finalize and _execute_with_lease skips lease release.
+            # The lease will expire and the reaper on the new instance
+            # will re-enqueue the run automatically.
             for task in pending:
                 for run_id, t in list(active_runs.items()):
                     if t is task:
                         _lease_loss_cancellations.add(run_id)
+                        _drain_cancellations.add(run_id)
                         break
 
             for task in pending:
@@ -314,7 +321,17 @@ class WorkerExecutor(BaseExecutor):
             heartbeat_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await asyncio.gather(job_task, heartbeat_task, return_exceptions=True)
-            await _release_lease(run_id, worker_name)
+
+            # Skip lease release for drain cancellations — the lease must
+            # expire naturally so the reaper on the new instance can find
+            # and re-enqueue the run. We check _drain_cancellations (not
+            # _lease_loss_cancellations) because execute_run's finally
+            # block discards from that set before we get here.
+            if run_id in _drain_cancellations:
+                _drain_cancellations.discard(run_id)
+                logger.info("Drain cancel: skipping lease release", run_id=run_id, worker=worker_name)
+            else:
+                await _release_lease(run_id, worker_name)
 
             elapsed = (datetime.now(UTC) - lease_acquired_at).total_seconds()
             logger.info(
