@@ -29,7 +29,7 @@ from aegra_api.models.run_job import RunJob
 from aegra_api.observability.span_enrichment import set_trace_context
 from aegra_api.services.base_executor import BaseExecutor
 from aegra_api.services.run_executor import _lease_loss_cancellations, execute_run
-from aegra_api.services.run_status import finalize_run, update_run_status
+from aegra_api.services.run_status import finalize_run, set_thread_status, update_run_status
 from aegra_api.settings import settings
 
 logger = structlog.getLogger(__name__)
@@ -37,6 +37,11 @@ logger = structlog.getLogger(__name__)
 # Terminal run states (kept local to avoid circular import with run_waiters -> executor)
 _TERMINAL_STATUSES = frozenset({"success", "error", "interrupted"})
 _RUN_ID_PATTERN = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+# Run IDs cancelled during executor.stop() (pod drain). Separate from
+# _lease_loss_cancellations because execute_run's finally block discards
+# from that set before _execute_with_lease can check it.
+_drain_cancellations: set[str] = set()
 
 
 def _is_valid_run_id(value: str) -> bool:
@@ -126,6 +131,18 @@ class WorkerExecutor(BaseExecutor):
         if self._job_tasks:
             logger.info("Draining in-flight jobs", count=len(self._job_tasks))
             _, pending = await asyncio.wait(self._job_tasks, timeout=drain_timeout)
+
+            # Mark pending tasks as drain cancellations so execute_run
+            # skips finalize and _execute_with_lease skips lease release.
+            # The lease will expire and the reaper on the new instance
+            # will re-enqueue the run automatically.
+            for task in pending:
+                for run_id, t in list(active_runs.items()):
+                    if t is task:
+                        _lease_loss_cancellations.add(run_id)
+                        _drain_cancellations.add(run_id)
+                        break
+
             for task in pending:
                 task.cancel()
             if pending:
@@ -219,7 +236,7 @@ class WorkerExecutor(BaseExecutor):
             )
             # Look up thread_id so we can set thread status to "error" too.
             # When wait_for fires, execute_run's CancelledError handler runs first
-            # and sets thread_status="idle" — we must correct that to "error".
+            # and sets thread_status="interrupted" — we must correct that to "error".
             thread_id = await _get_thread_id_for_run(run_id)
             if thread_id is not None:
                 await finalize_run(
@@ -230,7 +247,13 @@ class WorkerExecutor(BaseExecutor):
                     error="Job exceeded maximum execution time",
                 )
             else:
-                # Fallback: update run status only (thread_id lookup failed)
+                # Fallback: update run status only (thread_id lookup failed).
+                # Thread may be left in a stale state — this is an extreme edge
+                # case (run row deleted during execution).
+                logger.warning(
+                    "Could not look up thread_id for timed-out run; thread status may be stale",
+                    run_id=run_id,
+                )
                 await update_run_status(run_id, "error", error="Job exceeded maximum execution time")
             await _release_lease(run_id, worker_name)
         except asyncio.CancelledError:
@@ -298,7 +321,17 @@ class WorkerExecutor(BaseExecutor):
             heartbeat_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await asyncio.gather(job_task, heartbeat_task, return_exceptions=True)
-            await _release_lease(run_id, worker_name)
+
+            # Skip lease release for drain cancellations — the lease must
+            # expire naturally so the reaper on the new instance can find
+            # and re-enqueue the run. We check _drain_cancellations (not
+            # _lease_loss_cancellations) because execute_run's finally
+            # block discards from that set before we get here.
+            if run_id in _drain_cancellations:
+                _drain_cancellations.discard(run_id)
+                logger.info("Drain cancel: skipping lease release", run_id=run_id, worker=worker_name)
+            else:
+                await _release_lease(run_id, worker_name)
 
             elapsed = (datetime.now(UTC) - lease_acquired_at).total_seconds()
             logger.info(
@@ -376,10 +409,12 @@ async def _acquire_and_load(run_id: str, worker_name: str) -> _LoadedRun | None:
         await session.commit()
 
         if run_orm is None or run_orm.execution_params is None:
+            thread_id = run_orm.thread_id if run_orm is not None else None
             logger.warning(
                 "Run not found or missing execution_params after lease, releasing claim",
                 run_id=run_id,
                 worker=worker_name,
+                thread_id=thread_id,
             )
             await session.execute(
                 update(RunORM)
@@ -391,6 +426,11 @@ async def _acquire_and_load(run_id: str, worker_name: str) -> _LoadedRun | None:
                     error_message="Run missing execution_params (data corruption or pre-migration row)",
                 )
             )
+            if thread_id is not None:
+                try:
+                    await set_thread_status(session, thread_id, "error")
+                except ValueError:
+                    logger.warning("Thread not found while marking data corruption", thread_id=thread_id)
             await session.commit()
             return None
 
