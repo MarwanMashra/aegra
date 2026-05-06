@@ -17,6 +17,7 @@ from sqlalchemy import select, update
 from aegra_api.core.orm import Run as RunORM
 from aegra_api.core.orm import _get_session_maker
 from aegra_api.core.redis_manager import redis_manager
+from aegra_api.services.run_status import set_thread_status
 from aegra_api.settings import settings
 
 logger = structlog.getLogger(__name__)
@@ -195,9 +196,15 @@ class LeaseReaper:
 
     @staticmethod
     async def _mark_permanently_failed(run_ids: list[str]) -> None:
-        """Mark runs as error with max retries exceeded message."""
+        """Mark runs as error with max retries exceeded message and release their threads."""
         maker = _get_session_maker()
         async with maker() as session:
+            # Look up thread_ids before updating runs
+            result = await session.execute(
+                select(RunORM.thread_id).where(RunORM.run_id.in_(run_ids))
+            )
+            thread_ids = {row[0] for row in result.fetchall()}
+
             await session.execute(
                 update(RunORM)
                 .where(RunORM.run_id.in_(run_ids))
@@ -208,6 +215,17 @@ class LeaseReaper:
                     lease_expires_at=None,
                 )
             )
+
+            # Set thread status to error so threads aren't stuck in busy
+            for thread_id in thread_ids:
+                try:
+                    await set_thread_status(session, thread_id, "error")
+                except ValueError:
+                    logger.warning(
+                        "Thread not found while marking permanently failed",
+                        thread_id=thread_id,
+                    )
+
             await session.commit()
 
 

@@ -57,7 +57,7 @@ async def execute_run(job: RunJob) -> None:
             await finalize_run(
                 run_id,
                 thread_id,
-                status="interrupted",
+                status="success",
                 thread_status="interrupted",
                 output=final_output.data,
             )
@@ -78,7 +78,7 @@ async def execute_run(job: RunJob) -> None:
             is_lease_loss = True
             logger.info("Lease-loss cancel, skipping finalize", run_id=run_id)
         else:
-            await finalize_run(run_id, thread_id, status="interrupted", thread_status="idle", output={})
+            await finalize_run(run_id, thread_id, status="interrupted", thread_status="interrupted", output={})
             await _best_effort_signal(streaming_service.signal_run_cancelled, run_id)
         raise
     except Exception as exc:
